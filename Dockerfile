@@ -12,5 +12,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 
 EXPOSE 8000
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+
+# Arranca uvicorn con expansión de $PORT (o usa 8000 si no está definida)
+CMD sh -c "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"
+
 
