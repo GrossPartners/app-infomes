@@ -1,3 +1,12 @@
+from fastapi import FastAPI
+from fastapi.responses import RedirectResponse
+
+app = FastAPI()
+
+@app.get("/", include_in_schema=False)
+async def docs_redirect():
+    return RedirectResponse(url="/docs")
+
 from fastapi import FastAPI, UploadFile, HTTPException
 from pathlib import Path
 import tempfile, shutil
