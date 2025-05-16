@@ -8,8 +8,7 @@ from decimal import Decimal
 from pydantic import BaseModel, Field
 
 from helpers.pdf_utils import pdf_to_text
-from helpers.parsing import extract_values  # Debe extraer también “riesgo”
-
+from helpers.parsing import extract_values  # ahora extrae también “riesgo”
 # OCR deps
 from pdf2image import convert_from_path
 import pytesseract
@@ -22,27 +21,27 @@ async def docs_redirect():
 
 
 class InformeData(BaseModel):
-    activo_corriente:        Decimal = Field(..., alias="Activo Corriente")
-    pasivo_corriente:        Decimal = Field(..., alias="Pasivo Corriente")
-    pasivo_no_corriente:     Decimal = Field(..., alias="Pasivo No Corriente")
-    efectivo:                Decimal = Field(..., alias="Efectivo y otros líquidos")
-    patrimonio_neto:         Decimal = Field(..., alias="Patrimonio Neto")
-    fondos_propios:          Decimal = Field(..., alias="Fondos Propios")
-    resultado_antes_imp:     Decimal = Field(..., alias="Resultado antes de impuestos")
-    existencias:             Decimal = Field(..., alias="Existencias")
-    inv_grupo_cp:            Decimal = Field(..., alias="Inversiones grupo CP")
-    riesgo:                  Decimal = Field(..., alias="Riesgo")
+    activo_corriente:    Decimal = Field(..., alias="activo_corriente")
+    pasivo_corriente:    Decimal = Field(..., alias="pasivo_corriente")
+    pasivo_no_corriente: Decimal = Field(..., alias="pasivo_no_corriente")
+    efectivo:            Decimal = Field(..., alias="efectivo_liquido")
+    patrimonio_neto:     Decimal = Field(..., alias="patrimonio_neto")
+    fondos_propios:      Decimal = Field(..., alias="fondos_propios")
+    resultado_antes_imp: Decimal = Field(..., alias="resultado_antes_imp")
+    existencias:         Decimal = Field(..., alias="existencias")
+    inv_grupo_cp:        Decimal = Field(..., alias="inversiones_cp")
+    riesgo:              Decimal = Field(..., alias="riesgo")
 
 
 class Criterios(BaseModel):
     # principales
-    ratio_liquidez:             Decimal
-    ratio_ef_deuda_neta:        Decimal
-    ratio_pat_riesgo:           Decimal
+    ratio_liquidez:          Decimal
+    ratio_ef_deuda_neta:     Decimal
+    ratio_pat_riesgo:        Decimal
     # adicionales
-    pct_pat_activo:             Decimal
-    inv_grupo_mayor_50_ac:      bool
-    existencias_mayor_50_ac:    bool
+    pct_pat_activo:          Decimal
+    inv_grupo_mayor_50_ac:   bool
+    existencias_mayor_50_ac: bool
 
 
 @app.post("/upload")
@@ -57,14 +56,13 @@ async def upload(files: List[UploadFile] = File(...)):
             shutil.copyfileobj(file.file, out)
 
         # 2) Extraer texto nativo
-        text = pdf_to_text(pdf_path)
+        text = pdf_to_text(pdf_path) or ""
 
         # 3) Fallback a OCR si no hay texto
-        if not text or not text.strip():
+        if not text.strip():
             try:
-                images = convert_from_path(str(pdf_path))
                 ocr_text = ""
-                for img in images:
+                for img in convert_from_path(str(pdf_path)):
                     ocr_text += pytesseract.image_to_string(img, lang="spa")
                 text = ocr_text
             except Exception as e:
@@ -74,12 +72,12 @@ async def upload(files: List[UploadFile] = File(...)):
                 })
                 continue
 
-        # 4) Extraer valores
+        # 4) Extraer valores (incluye ya “riesgo”)
         raw_vals = extract_values(text)
         if not raw_vals:
             resultados.append({
                 "filename": file.filename,
-                "error": "No se encontraron importes reconocibles"
+                "error": "No se encontraron todos los importes requeridos"
             })
             continue
 
@@ -104,16 +102,16 @@ async def upload(files: List[UploadFile] = File(...)):
         # patrimonio / riesgo
         r_pat_riesgo = info.patrimonio_neto / info.riesgo
 
-        # patrimonio / total activo
-        total_activo = (
-            info.activo_corriente +
-            info.pasivo_corriente +
-            info.pasivo_no_corriente +
-            info.patrimonio_neto
-        )
-        pct_pat_act = info.patrimonio_neto / total_activo
+        # para total_activo necesitamos también Activo No Corriente
+        # lo buscamos rápido con regex (o podrías ampliarlo en el helper)
+        import re
+        from helpers.parsing import _to_decimal  # aprovechamos la función
+        m = re.search(r"Activo\s+No\s+Corriente\s+([\d\.,]+)", text, flags=re.I)
+        activo_no_corr = _to_decimal(m.group(1)) if m else Decimal(0)
+        total_act = info.activo_corriente + activo_no_corr
 
-        # criterios adicionales
+        pct_pat_act = info.patrimonio_neto / total_act
+
         inv_flag = info.inv_grupo_cp > (info.activo_corriente * Decimal("0.5"))
         exist_flag = info.existencias > (info.activo_corriente * Decimal("0.5"))
 
@@ -132,15 +130,19 @@ async def upload(files: List[UploadFile] = File(...)):
             "kb": round(pdf_path.stat().st_size / 1024, 1),
             "data": info.dict(by_alias=True),
             "criterios_principales": {
-                "Activo Corriente / Pasivo Corriente": str(criterios.ratio_liquidez),
-                "(Efectivo - Deuda Neta) / Riesgo": str(criterios.ratio_ef_deuda_neta),
-                "Patrimonio Neto / Riesgo": str(criterios.ratio_pat_riesgo),
+                "AC/PC":                    str(criterios.ratio_liquidez),
+                "(E - Deuda Neta)/Riesgo":  str(criterios.ratio_ef_deuda_neta),
+                "PN/Riesgo":                str(criterios.ratio_pat_riesgo),
             },
             "criterios_adicionales": {
-                "Patrimonio Neto / Total Activo": str(criterios.pct_pat_activo),
-                "Inv. Grupo CP > 50% AC": criterios.inv_grupo_mayor_50_ac,
-                "Existencias > 50% AC": criterios.existencias_mayor_50_ac,
+                "PN/TotalActivo":           str(criterios.pct_pat_activo),
+                "InvGrupoCP>50%AC":         criterios.inv_grupo_mayor_50_ac,
+                "Exist>50%AC":              criterios.existencias_mayor_50_ac,
             }
+        })
+
+    return resultados
+
         })
 
     return resultados
