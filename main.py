@@ -1,5 +1,5 @@
 # main.py
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import RedirectResponse
 from typing import List
 from pathlib import Path
@@ -8,7 +8,7 @@ from decimal import Decimal
 from pydantic import BaseModel, Field
 
 from helpers.pdf_utils import pdf_to_text
-from helpers.parsing import extract_values
+from helpers.parsing import extract_values  # Debe extraer también “riesgo”
 
 # OCR deps
 from pdf2image import convert_from_path
@@ -21,18 +21,28 @@ async def docs_redirect():
     return RedirectResponse(url="/docs")
 
 
-class Ratios(BaseModel):
-    activo_corriente:  Decimal = Field(..., gt=0)
-    pasivo_corriente:  Decimal = Field(..., gt=0)
-    patrimonio_neto:   Decimal = Field(..., gt=0)
+class InformeData(BaseModel):
+    activo_corriente:        Decimal = Field(..., alias="Activo Corriente")
+    pasivo_corriente:        Decimal = Field(..., alias="Pasivo Corriente")
+    pasivo_no_corriente:     Decimal = Field(..., alias="Pasivo No Corriente")
+    efectivo:                Decimal = Field(..., alias="Efectivo y otros líquidos")
+    patrimonio_neto:         Decimal = Field(..., alias="Patrimonio Neto")
+    fondos_propios:          Decimal = Field(..., alias="Fondos Propios")
+    resultado_antes_imp:     Decimal = Field(..., alias="Resultado antes de impuestos")
+    existencias:             Decimal = Field(..., alias="Existencias")
+    inv_grupo_cp:            Decimal = Field(..., alias="Inversiones grupo CP")
+    riesgo:                  Decimal = Field(..., alias="Riesgo")
 
-    @property
-    def fondo_maniobra(self) -> Decimal:
-        return self.activo_corriente - self.pasivo_corriente
 
-    @property
-    def ratio_liquidez(self) -> Decimal:
-        return self.activo_corriente / self.pasivo_corriente
+class Criterios(BaseModel):
+    # principales
+    ratio_liquidez:             Decimal
+    ratio_ef_deuda_neta:        Decimal
+    ratio_pat_riesgo:           Decimal
+    # adicionales
+    pct_pat_activo:             Decimal
+    inv_grupo_mayor_50_ac:      bool
+    existencias_mayor_50_ac:    bool
 
 
 @app.post("/upload")
@@ -43,14 +53,14 @@ async def upload(files: List[UploadFile] = File(...)):
         # 1) Guardar temporalmente
         tmpdir = tempfile.mkdtemp()
         pdf_path = Path(tmpdir) / file.filename
-        with pdf_path.open("wb") as f:
-            shutil.copyfileobj(file.file, f)
+        with pdf_path.open("wb") as out:
+            shutil.copyfileobj(file.file, out)
 
-        # 2) Intentar extraer texto nativo
+        # 2) Extraer texto nativo
         text = pdf_to_text(pdf_path)
 
-        # 3) Si está vacío o no hay datos, fallback OCR
-        if not text or text.strip() == "":
+        # 3) Fallback a OCR si no hay texto
+        if not text or not text.strip():
             try:
                 images = convert_from_path(str(pdf_path))
                 ocr_text = ""
@@ -58,44 +68,79 @@ async def upload(files: List[UploadFile] = File(...)):
                     ocr_text += pytesseract.image_to_string(img, lang="spa")
                 text = ocr_text
             except Exception as e:
-                # Si falla OCR, lo registramos y seguimos
                 resultados.append({
                     "filename": file.filename,
                     "error": f"Error en OCR: {e}"
                 })
                 continue
 
-        # 4) Extraer importes
-        values = extract_values(text)
-        if not values:
+        # 4) Extraer valores
+        raw_vals = extract_values(text)
+        if not raw_vals:
             resultados.append({
                 "filename": file.filename,
                 "error": "No se encontraron importes reconocibles"
             })
             continue
 
-        # 5) Calcular ratios
+        # 5) Validar e instanciar InformeData
         try:
-            r = Ratios(**values)
+            info = InformeData(**raw_vals)
         except Exception as e:
             resultados.append({
                 "filename": file.filename,
-                "error": f"Error calculando ratios: {e}"
+                "error": f"Campos faltantes o mal formateados: {e}"
             })
             continue
 
-        # 6) Construir respuesta
+        # 6) Calcular criterios
+        # ratio liquidez = AC / PC
+        r_liq = info.activo_corriente / info.pasivo_corriente
+
+        # deuda neta = PC + PNC
+        deuda_neta = info.pasivo_corriente + info.pasivo_no_corriente
+        r_ef_deu = (info.efectivo - deuda_neta) / info.riesgo
+
+        # patrimonio / riesgo
+        r_pat_riesgo = info.patrimonio_neto / info.riesgo
+
+        # patrimonio / total activo
+        total_activo = (
+            info.activo_corriente +
+            info.pasivo_corriente +
+            info.pasivo_no_corriente +
+            info.patrimonio_neto
+        )
+        pct_pat_act = info.patrimonio_neto / total_activo
+
+        # criterios adicionales
+        inv_flag = info.inv_grupo_cp > (info.activo_corriente * Decimal("0.5"))
+        exist_flag = info.existencias > (info.activo_corriente * Decimal("0.5"))
+
+        criterios = Criterios(
+            ratio_liquidez = r_liq.quantize(Decimal("0.01")),
+            ratio_ef_deuda_neta = r_ef_deu.quantize(Decimal("0.01")),
+            ratio_pat_riesgo = r_pat_riesgo.quantize(Decimal("0.01")),
+            pct_pat_activo = pct_pat_act.quantize(Decimal("0.01")),
+            inv_grupo_mayor_50_ac = inv_flag,
+            existencias_mayor_50_ac = exist_flag
+        )
+
+        # 7) Responder
         resultados.append({
             "filename": file.filename,
             "kb": round(pdf_path.stat().st_size / 1024, 1),
-            "data": values,
-            "fondo_maniobra": str(r.fondo_maniobra),
-            "ratio_liquidez": str(round(r.ratio_liquidez, 2)),
+            "data": info.dict(by_alias=True),
+            "criterios_principales": {
+                "Activo Corriente / Pasivo Corriente": str(criterios.ratio_liquidez),
+                "(Efectivo - Deuda Neta) / Riesgo": str(criterios.ratio_ef_deuda_neta),
+                "Patrimonio Neto / Riesgo": str(criterios.ratio_pat_riesgo),
+            },
+            "criterios_adicionales": {
+                "Patrimonio Neto / Total Activo": str(criterios.pct_pat_activo),
+                "Inv. Grupo CP > 50% AC": criterios.inv_grupo_mayor_50_ac,
+                "Existencias > 50% AC": criterios.existencias_mayor_50_ac,
+            }
         })
 
     return resultados
-
-
-    return resultados
-
-
