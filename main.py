@@ -1,5 +1,5 @@
 # main.py
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import RedirectResponse
 from typing import List
 from pathlib import Path
@@ -8,7 +8,7 @@ from decimal import Decimal
 from pydantic import BaseModel, Field
 
 from helpers.pdf_utils import pdf_to_text
-from helpers.parsing import extract_values   # solo esto, no hace falta _to_decimal aquí
+from helpers.parsing import extract_values
 
 from pdf2image import convert_from_path
 import pytesseract
@@ -47,16 +47,15 @@ async def upload(files: List[UploadFile] = File(...)):
     resultados = []
 
     for file in files:
-        # 1) Guardar temporalmente
         tmpdir = tempfile.mkdtemp()
         pdf_path = Path(tmpdir) / file.filename
         with pdf_path.open("wb") as out:
             shutil.copyfileobj(file.file, out)
 
-        # 2) Extraer texto nativo
+        # 1) Intento texto nativo
         text = pdf_to_text(pdf_path) or ""
-        # 3) Fallback OCR si hace falta
         if not text.strip():
+            # 2) Fallback OCR
             try:
                 text = "".join(
                     pytesseract.image_to_string(img, lang="spa")
@@ -65,40 +64,42 @@ async def upload(files: List[UploadFile] = File(...)):
             except Exception as e:
                 resultados.append({
                     "filename": file.filename,
-                    "error": f"Error en OCR: {e}"
+                    "error": f"Error OCR: {e}"
                 })
                 continue
 
-        # 4) Extraer valores (todos o {})
+        # 3) EXTRA DEBUG: guarda primeros 500 carácteres
+        snippet = text[:500]
+
+        # 4) parseo
         raw = extract_values(text)
         if not raw:
             resultados.append({
                 "filename": file.filename,
-                "error": "Faltan importes en el PDF"
+                "error": "Faltan importes en el PDF",
+                "text_snippet": snippet  # <-- te devuelve lo que ve
             })
             continue
 
-        # 5) Validar e instanciar InformeData
+        # 5) Validación de campos
         try:
             info = InformeData(**raw)
         except Exception as e:
             resultados.append({
                 "filename": file.filename,
-                "error": f"Formatos inválidos: {e}"
+                "error": f"Formatos inválidos: {e}",
+                "raw_values": raw
             })
             continue
 
-        # 6) Calcular criterios
+        # 6) Cálculo de ratios
         r_liq = info.activo_corriente / info.pasivo_corriente
         deuda_neta = info.pasivo_corriente + info.pasivo_no_corriente
         r_ef_deu = (info.efectivo_liquido - deuda_neta) / info.riesgo
         r_pat_riesgo = info.patrimonio_neto / info.riesgo
 
-        # Total activo = corriente + no corriente (no extraído) → ui fallback 0
-        # Si necesitas Activo No Corriente, añádelo al extractor.
-        act_no_corr = raw.get("activo_no_corriente", Decimal(0))
-        total_act = info.activo_corriente + act_no_corr
-
+        # 7) Total activo (incluye no corriente si lo extraes en el parser)
+        total_act = info.activo_corriente + raw.get("activo_no_corriente", Decimal(0))
         pct_pat_act = info.patrimonio_neto / total_act if total_act else Decimal(0)
 
         inv_flag = info.inversiones_cp > (info.activo_corriente * Decimal("0.5"))
@@ -113,22 +114,48 @@ async def upload(files: List[UploadFile] = File(...)):
             existencias_mayor_50_ac=exist_flag,
         )
 
-        # 7) Construir respuesta
         resultados.append({
             "filename": file.filename,
             "kb": round(pdf_path.stat().st_size / 1024, 1),
             "data": info.dict(by_alias=True),
             "criterios_principales": {
                 "AC/PC": str(criterios.ratio_liquidez),
-                "(E - DeudaNeta) / Riesgo": str(criterios.ratio_ef_deuda_neta),
-                "PN / Riesgo": str(criterios.ratio_pat_riesgo),
+                "(E - DeudaNeta)/Riesgo": str(criterios.ratio_ef_deuda_neta),
+                "PN/Riesgo": str(criterios.ratio_pat_riesgo),
             },
             "criterios_adicionales": {
-                "PN / TotalActivo": str(criterios.pct_pat_activo),
-                "InvGrupoCP > 50% AC": criterios.inv_grupo_mayor_50_ac,
-                "Existencias > 50% AC": criterios.existencias_mayor_50_ac,
+                "PN/TotalActivo": str(criterios.pct_pat_activo),
+                "InvGrupoCP>50%AC": criterios.inv_grupo_mayor_50_ac,
+                "Exist>50%AC": criterios.existencias_mayor_50_ac,
             }
         })
+
+    return resultados
+
+
+@app.post("/debug", include_in_schema=False)
+async def debug_one(file: UploadFile = File(...)):
+    """
+    Subelo aquí para ver TEXT y RAW sin lógica de ratios.
+    """
+    tmpdir = tempfile.mkdtemp()
+    pdf_path = Path(tmpdir) / file.filename
+    with pdf_path.open("wb") as out:
+        shutil.copyfileobj(file.file, out)
+
+    text = pdf_to_text(pdf_path) or ""
+    if not text.strip():
+        text = "".join(
+            pytesseract.image_to_string(img, lang="spa")
+            for img in convert_from_path(str(pdf_path))
+        )
+
+    raw = extract_values(text) or {}
+    return {
+        "filename": file.filename,
+        "text_snippet": text[:500],
+        "raw_values": raw
+    }
 
     # ← Este return debe quedar alineado con el for, no indent extra
     return resultados
