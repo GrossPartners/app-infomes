@@ -8,10 +8,10 @@ from decimal import Decimal
 from pydantic import BaseModel, Field
 
 from helpers.pdf_utils import pdf_to_text
-from helpers.parsing import extract_values  # ahora extrae también “riesgo”
-# OCR deps
+from helpers.parsing import extract_values, _to_decimal
 from pdf2image import convert_from_path
 import pytesseract
+import re
 
 app = FastAPI(title="App Informes")
 
@@ -34,11 +34,9 @@ class InformeData(BaseModel):
 
 
 class Criterios(BaseModel):
-    # principales
     ratio_liquidez:          Decimal
     ratio_ef_deuda_neta:     Decimal
     ratio_pat_riesgo:        Decimal
-    # adicionales
     pct_pat_activo:          Decimal
     inv_grupo_mayor_50_ac:   bool
     existencias_mayor_50_ac: bool
@@ -72,7 +70,7 @@ async def upload(files: List[UploadFile] = File(...)):
                 })
                 continue
 
-        # 4) Extraer valores (incluye ya “riesgo”)
+        # 4) Extraer valores
         raw_vals = extract_values(text)
         if not raw_vals:
             resultados.append({
@@ -92,36 +90,27 @@ async def upload(files: List[UploadFile] = File(...)):
             continue
 
         # 6) Calcular criterios
-        # ratio liquidez = AC / PC
         r_liq = info.activo_corriente / info.pasivo_corriente
-
-        # deuda neta = PC + PNC
         deuda_neta = info.pasivo_corriente + info.pasivo_no_corriente
         r_ef_deu = (info.efectivo - deuda_neta) / info.riesgo
-
-        # patrimonio / riesgo
         r_pat_riesgo = info.patrimonio_neto / info.riesgo
 
-        # para total_activo necesitamos también Activo No Corriente
-        # lo buscamos rápido con regex (o podrías ampliarlo en el helper)
-        import re
-        from helpers.parsing import _to_decimal  # aprovechamos la función
+        # para el total activo necesitamos Activo No Corriente
         m = re.search(r"Activo\s+No\s+Corriente\s+([\d\.,]+)", text, flags=re.I)
         activo_no_corr = _to_decimal(m.group(1)) if m else Decimal(0)
         total_act = info.activo_corriente + activo_no_corr
 
         pct_pat_act = info.patrimonio_neto / total_act
-
         inv_flag = info.inv_grupo_cp > (info.activo_corriente * Decimal("0.5"))
         exist_flag = info.existencias > (info.activo_corriente * Decimal("0.5"))
 
         criterios = Criterios(
-            ratio_liquidez = r_liq.quantize(Decimal("0.01")),
-            ratio_ef_deuda_neta = r_ef_deu.quantize(Decimal("0.01")),
-            ratio_pat_riesgo = r_pat_riesgo.quantize(Decimal("0.01")),
-            pct_pat_activo = pct_pat_act.quantize(Decimal("0.01")),
-            inv_grupo_mayor_50_ac = inv_flag,
-            existencias_mayor_50_ac = exist_flag
+            ratio_liquidez=r_liq.quantize(Decimal("0.01")),
+            ratio_ef_deuda_neta=r_ef_deu.quantize(Decimal("0.01")),
+            ratio_pat_riesgo=r_pat_riesgo.quantize(Decimal("0.01")),
+            pct_pat_activo=pct_pat_act.quantize(Decimal("0.01")),
+            inv_grupo_mayor_50_ac=inv_flag,
+            existencias_mayor_50_ac=exist_flag
         )
 
         # 7) Responder
@@ -130,19 +119,16 @@ async def upload(files: List[UploadFile] = File(...)):
             "kb": round(pdf_path.stat().st_size / 1024, 1),
             "data": info.dict(by_alias=True),
             "criterios_principales": {
-                "AC/PC":                    str(criterios.ratio_liquidez),
-                "(E - Deuda Neta)/Riesgo":  str(criterios.ratio_ef_deuda_neta),
-                "PN/Riesgo":                str(criterios.ratio_pat_riesgo),
+                "AC/PC":                   str(criterios.ratio_liquidez),
+                "(E-DeudaNeta)/Riesgo":    str(criterios.ratio_ef_deuda_neta),
+                "PN/Riesgo":               str(criterios.ratio_pat_riesgo),
             },
             "criterios_adicionales": {
-                "PN/TotalActivo":           str(criterios.pct_pat_activo),
-                "InvGrupoCP>50%AC":         criterios.inv_grupo_mayor_50_ac,
-                "Exist>50%AC":              criterios.existencias_mayor_50_ac,
+                "PN/TotalActivo":          str(criterios.pct_pat_activo),
+                "InvGrupoCP>50%AC":        criterios.inv_grupo_mayor_50_ac,
+                "Exist>50%AC":             criterios.existencias_mayor_50_ac,
             }
         })
 
     return resultados
 
-        })
-
-    return resultados
