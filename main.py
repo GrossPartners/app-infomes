@@ -73,6 +73,7 @@ async def upload(files: List[UploadFile] = File(...)):
 
         # 4) parseo
         raw = extract_values(text)
+        print("🔍 raw =", raw)
         if not raw:
             resultados.append({
                 "filename": file.filename,
